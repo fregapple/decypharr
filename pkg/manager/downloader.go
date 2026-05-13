@@ -3,6 +3,7 @@ package manager
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -35,8 +36,11 @@ const (
 	symlinkScanInitialInterval  = 100 * time.Millisecond
 	symlinkScanMaxInterval      = 2 * time.Second
 	symlinkReadyTimeout         = 2 * time.Minute
+	symlinkReadyRequiredPasses  = 3
+	symlinkReadyPassInterval    = 3 * time.Second
 	symlinkReadyInitialInterval = 200 * time.Millisecond
 	symlinkReadyMaxInterval     = 2 * time.Second
+	symlinkFinalSettleDelay     = 2 * time.Second
 	symlinkLogEveryAttempts     = 10
 	symlinkLogSampleSize        = 8
 )
@@ -206,6 +210,15 @@ func (d *Downloader) processSymlink(entry *storage.Entry, mountPath string) erro
 	if err := d.waitForSymlinkFilesReady(filePaths, symlinkReadyTimeout); err != nil {
 		return err
 	}
+	if symlinkFinalSettleDelay > 0 {
+		d.logger.Debug().
+			Dur("delay", symlinkFinalSettleDelay).
+			Int("files", len(filePaths)).
+			Msg("Applying final settle delay after symlink readiness")
+		if err := d.sleepUntilNextSymlinkAttempt(symlinkFinalSettleDelay, time.Now().Add(symlinkFinalSettleDelay)); err != nil {
+			return err
+		}
+	}
 
 	// Run ffprobe on files to warm cache and trigger imports
 	if !d.manager.config.SkipPreCache && len(filePaths) > 0 {
@@ -316,9 +329,18 @@ func (d *Downloader) waitForSymlinkFilesReady(filePaths []string, timeout time.D
 		return nil
 	}
 
+	requiredPasses := symlinkReadyRequiredPasses
+	if requiredPasses < 1 {
+		requiredPasses = 1
+	}
+
 	pending := make(map[string]error, len(filePaths))
+	readyPasses := make(map[string]int, len(filePaths))
+	lastReadySize := make(map[string]int64, len(filePaths))
 	for _, path := range filePaths {
 		pending[path] = nil
+		readyPasses[path] = 0
+		lastReadySize[path] = -1
 	}
 
 	deadline := time.Now().Add(timeout)
@@ -328,11 +350,26 @@ func (d *Downloader) waitForSymlinkFilesReady(filePaths []string, timeout time.D
 	for len(pending) > 0 {
 		attempt++
 		for path := range pending {
-			if err := verifySymlinkFileReady(path); err != nil {
+			size, err := verifySymlinkFileReady(path)
+			if err != nil {
+				readyPasses[path] = 0
+				lastReadySize[path] = -1
 				pending[path] = err
 				continue
 			}
+			if lastReadySize[path] >= 0 && lastReadySize[path] != size {
+				readyPasses[path] = 1
+			} else {
+				readyPasses[path]++
+			}
+			lastReadySize[path] = size
+			if readyPasses[path] < requiredPasses {
+				pending[path] = fmt.Errorf("ready pass %d/%d (size=%d)", readyPasses[path], requiredPasses, size)
+				continue
+			}
 			delete(pending, path)
+			delete(readyPasses, path)
+			delete(lastReadySize, path)
 		}
 		if len(pending) == 0 {
 			return nil
@@ -353,33 +390,50 @@ func (d *Downloader) waitForSymlinkFilesReady(filePaths []string, timeout time.D
 			return err
 		}
 		delay = nextSymlinkBackoff(delay, symlinkReadyMaxInterval)
+		if symlinkReadyPassInterval > delay {
+			delay = symlinkReadyPassInterval
+		}
 	}
 
 	return nil
 }
 
-func verifySymlinkFileReady(path string) error {
+func verifySymlinkFileReady(path string) (int64, error) {
 	info, err := os.Lstat(path)
 	if err != nil {
-		return fmt.Errorf("symlink not available: %w", err)
+		return 0, fmt.Errorf("symlink not available: %w", err)
 	}
 	if info.Mode()&os.ModeSymlink == 0 {
-		return fmt.Errorf("path is not a symlink")
+		return 0, fmt.Errorf("path is not a symlink")
 	}
 
 	targetInfo, err := os.Stat(path)
 	if err != nil {
-		return fmt.Errorf("symlink target not available: %w", err)
+		return 0, fmt.Errorf("symlink target not available: %w", err)
 	}
 	if targetInfo.IsDir() {
-		return fmt.Errorf("symlink target is a directory")
+		return 0, fmt.Errorf("symlink target is a directory")
+	}
+	if targetInfo.Size() <= 0 {
+		return 0, fmt.Errorf("symlink target size is zero")
 	}
 
 	f, err := os.Open(path)
 	if err != nil {
-		return fmt.Errorf("symlink target cannot be opened: %w", err)
+		return 0, fmt.Errorf("symlink target cannot be opened: %w", err)
 	}
-	return f.Close()
+	defer f.Close()
+
+	buf := make([]byte, 1)
+	n, readErr := f.Read(buf)
+	if readErr != nil && readErr != io.EOF {
+		return 0, fmt.Errorf("symlink target cannot be read: %w", readErr)
+	}
+	if n == 0 {
+		return 0, fmt.Errorf("symlink target returned no readable bytes")
+	}
+
+	return targetInfo.Size(), nil
 }
 
 func (d *Downloader) sleepUntilNextSymlinkAttempt(delay time.Duration, deadline time.Time) error {
