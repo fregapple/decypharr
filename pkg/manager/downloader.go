@@ -36,11 +36,11 @@ const (
 	symlinkScanInitialInterval  = 100 * time.Millisecond
 	symlinkScanMaxInterval      = 2 * time.Second
 	symlinkReadyTimeout         = 2 * time.Minute
-	symlinkReadyRequiredPasses  = 3
-	symlinkReadyPassInterval    = 3 * time.Second
+	symlinkReadyRequiredPasses  = 2
+	symlinkReadyPassInterval    = 1 * time.Second
 	symlinkReadyInitialInterval = 200 * time.Millisecond
 	symlinkReadyMaxInterval     = 2 * time.Second
-	symlinkFinalSettleDelay     = 2 * time.Second
+	symlinkFinalSettleDelay     = 0 * time.Second
 	symlinkLogEveryAttempts     = 10
 	symlinkLogSampleSize        = 8
 )
