@@ -3,6 +3,7 @@ package manager
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -17,16 +18,29 @@ type FileValidator struct {
 	logger zerolog.Logger
 
 	// Hardcoded configuration
-	ProbeTimeout  time.Duration
-	DecodeTimeout time.Duration
+	ProbeTimeout    time.Duration
+	DecodeTimeout   time.Duration
+	DecodeWindowSec int
+	DeepScan        bool
 }
 
 // NewFileValidator creates a validator with hardcoded settings
 func NewFileValidator() *FileValidator {
+	deep := strings.EqualFold(strings.TrimSpace(os.Getenv("DECYPHARR_VALIDATOR_DEEP_SCAN")), "true") || strings.TrimSpace(os.Getenv("DECYPHARR_VALIDATOR_DEEP_SCAN")) == "1"
+	decodeTimeout := 60 * time.Second
+	decodeWindowSec := 60
+	if deep {
+		// Full-file decode can be very long on large media.
+		decodeTimeout = 30 * time.Minute
+		decodeWindowSec = 0
+	}
+
 	return &FileValidator{
-		logger:        logger.New("validator"),
-		ProbeTimeout:  30 * time.Second,
-		DecodeTimeout: 60 * time.Second,
+		logger:          logger.New("validator"),
+		ProbeTimeout:    30 * time.Second,
+		DecodeTimeout:   decodeTimeout,
+		DecodeWindowSec: decodeWindowSec,
+		DeepScan:        deep,
 	}
 }
 
@@ -40,7 +54,11 @@ func (v *FileValidator) ValidateFile(ctx context.Context, filepath string) (brok
 		return true, fmt.Sprintf("ffprobe failed: %v", err)
 	}
 
-	v.logger.Debug().Str("file", filepath).Msg("ValidateFile: ffprobe passed, starting ffmpeg decode stage")
+	v.logger.Debug().
+		Str("file", filepath).
+		Bool("deep_scan", v.DeepScan).
+		Int("decode_window_sec", v.DecodeWindowSec).
+		Msg("ValidateFile: ffprobe passed, starting ffmpeg decode stage")
 	// Stage 2: FFmpeg decode validation
 	if err := v.runFFmpegDecode(ctx, filepath); err != nil {
 		v.logger.Info().Err(err).Str("file", filepath).Msg("ValidateFile: ffmpeg decode failed")
@@ -84,18 +102,28 @@ func (v *FileValidator) runFFprobe(ctx context.Context, filepath string) error {
 	return nil
 }
 
-// runFFmpegDecode runs a full decode test on all mapped streams.
+// runFFmpegDecode runs either a fast 60s smoke test (default) or full-file
+// decode (deep-scan mode).
 func (v *FileValidator) runFFmpegDecode(ctx context.Context, filepath string) error {
 	ctx, cancel := context.WithTimeout(ctx, v.DecodeTimeout)
 	defer cancel()
 
-	// Decode the full file and all streams so corruption in later segments or
-	// secondary tracks is surfaced.
-	cmd := exec.CommandContext(ctx, "ffmpeg",
-		"-v", "error", "-xerror",
-		"-i", filepath,
-		"-map", "0",
-		"-f", "null", "-")
+	args := []string{"-v", "error", "-xerror"}
+	if !v.DeepScan && v.DecodeWindowSec > 0 {
+		// Fast mode: keep this cheap for large libraries.
+		args = append(args, "-t", fmt.Sprintf("%d", v.DecodeWindowSec))
+	}
+	args = append(args, "-i", filepath)
+	if v.DeepScan {
+		// Deep mode: validate every stream in the file.
+		args = append(args, "-map", "0")
+	} else {
+		// Fast mode: probe primary video/audio streams for quick detection.
+		args = append(args, "-map", "0:v:0", "-map", "0:a:0")
+	}
+	args = append(args, "-f", "null", "-")
+
+	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
 
 	if out, err := cmd.CombinedOutput(); err != nil {
 		if ctx.Err() != nil {
