@@ -151,6 +151,77 @@ func (d *Downloader) notifyCompleted(entry *storage.Entry) {
 	})
 }
 
+var mediaFileExtensions = map[string]bool{
+	".mkv": true, ".mp4": true, ".avi": true, ".mov": true,
+	".wmv": true, ".m4v": true, ".ts": true, ".m2ts": true,
+	".mp3": true, ".flac": true, ".aac": true, ".m4a": true,
+}
+
+func isMediaFile(name string) bool {
+	return mediaFileExtensions[strings.ToLower(filepath.Ext(name))]
+}
+
+// validateGrabFiles runs ffprobe validation on each media file in filePaths.
+// Returns the first broken file path and reason, or broken=false if all pass.
+func (d *Downloader) validateGrabFiles(ctx context.Context, filePaths []string) (brokenPath, reason string, broken bool) {
+	v := d.manager.repair.validator
+	if v == nil {
+		return "", "", false
+	}
+	for _, fp := range filePaths {
+		if !isMediaFile(fp) {
+			continue
+		}
+		if b, r := v.ValidateFile(ctx, fp); b {
+			return fp, r, true
+		}
+	}
+	return "", "", false
+}
+
+// handleBrokenGrab marks an entry as failed and tells the arr to blocklist the
+// grab and trigger a re-search so a replacement is found automatically.
+func (d *Downloader) handleBrokenGrab(ctx context.Context, entry *storage.Entry, brokenFile, reason string) {
+	validationErr := fmt.Errorf("file validation failed: %s (%s)", filepath.Base(brokenFile), reason)
+	d.logger.Warn().
+		Str("entry", entry.Name).
+		Str("file", brokenFile).
+		Str("reason", reason).
+		Msg("Grab validation failed — blocklisting and triggering re-search")
+	d.markAsError(entry, validationErr)
+
+	a := d.manager.arr.GetOrCreate(entry.Category)
+	if a == nil || a.Host == "" || a.Token == "" {
+		return
+	}
+
+	// Prefer blocklisting via the arr queue while the item is still there.
+	toBlocklist := make(map[int]bool)
+	for _, q := range a.GetQueue() {
+		if strings.EqualFold(q.DownloadId, entry.InfoHash) {
+			toBlocklist[q.Id] = true
+		}
+	}
+	if len(toBlocklist) > 0 {
+		if err := a.BlackListAndResearchItems(toBlocklist); err != nil {
+			d.logger.Warn().Err(err).Str("entry", entry.Name).Msg("handleBrokenGrab: queue blocklist failed")
+		}
+		return
+	}
+
+	// Fallback: mark grab history as failed, which triggers Sonarr/Radarr
+	// auto-re-search when "Redownload Failed" is enabled (the default).
+	hist := a.GetHistory(entry.InfoHash, "grabbed")
+	if hist == nil {
+		return
+	}
+	for _, rec := range hist.Records {
+		if err := a.MarkHistoryFailed(rec.ID); err != nil {
+			d.logger.Warn().Err(err).Int("history_id", rec.ID).Msg("handleBrokenGrab: MarkHistoryFailed failed")
+		}
+	}
+}
+
 func (d *Downloader) triggerArrRefresh(entry *storage.Entry) {
 	go func() {
 		a := d.manager.arr.GetOrCreate(entry.Category)
@@ -219,6 +290,11 @@ func (d *Downloader) processSymlink(entry *storage.Entry, mountPath string) erro
 		} else {
 			d.logger.Debug().Str("entry", entry.Name).Msgf("Ran ffprobe on %d/%d files", len(probeFiles), len(filePaths))
 		}
+	}
+
+	if brokenPath, reason, broken := d.validateGrabFiles(d.manager.ctx, filePaths); broken {
+		d.handleBrokenGrab(d.manager.ctx, entry, brokenPath, reason)
+		return nil
 	}
 
 	d.completeEntry(entry)
@@ -544,6 +620,16 @@ func (d *Downloader) processTorrentDownload(entry *storage.Entry) error {
 	if err := p.Wait(); err != nil {
 		return fmt.Errorf("download failed: %w", err)
 	}
+
+	downloadedPaths := make([]string, 0, len(tasks))
+	for _, task := range tasks {
+		downloadedPaths = append(downloadedPaths, filepath.Join(downloadedFolder, task.file.Name))
+	}
+	if brokenPath, reason, broken := d.validateGrabFiles(d.manager.ctx, downloadedPaths); broken {
+		d.handleBrokenGrab(d.manager.ctx, entry, brokenPath, reason)
+		return nil
+	}
+
 	d.completeEntry(entry)
 	d.logger.Info().Msgf("Downloaded all files for %s", entry.Name)
 	return nil
@@ -621,6 +707,15 @@ func (d *Downloader) processUsenetDownload(entry *storage.Entry) error {
 		entry.MarkAsError(err)
 		_ = d.manager.queue.Update(entry)
 		return fmt.Errorf("NZB download failed: %w", err)
+	}
+
+	downloadedPaths := make([]string, 0, len(files))
+	for _, file := range files {
+		downloadedPaths = append(downloadedPaths, filepath.Join(downloadedFolder, file.Name))
+	}
+	if brokenPath, reason, broken := d.validateGrabFiles(d.manager.ctx, downloadedPaths); broken {
+		d.handleBrokenGrab(d.manager.ctx, entry, brokenPath, reason)
+		return nil
 	}
 
 	d.completeEntry(entry)
