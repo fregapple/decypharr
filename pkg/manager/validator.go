@@ -17,30 +17,44 @@ import (
 type FileValidator struct {
 	logger zerolog.Logger
 
-	// Hardcoded configuration
 	ProbeTimeout    time.Duration
 	DecodeTimeout   time.Duration
 	DecodeWindowSec int
 	DeepScan        bool
+
+	ffmpegAvailable  bool
+	ffprobeAvailable bool
 }
 
 // NewFileValidator creates a validator with hardcoded settings
 func NewFileValidator() *FileValidator {
+	l := logger.New("validator")
+
 	deep := strings.EqualFold(strings.TrimSpace(os.Getenv("DECYPHARR_VALIDATOR_DEEP_SCAN")), "true") || strings.TrimSpace(os.Getenv("DECYPHARR_VALIDATOR_DEEP_SCAN")) == "1"
 	decodeTimeout := 60 * time.Second
 	decodeWindowSec := 60
 	if deep {
-		// Full-file decode can be very long on large media.
 		decodeTimeout = 30 * time.Minute
 		decodeWindowSec = 0
 	}
 
+	_, ffmpegErr := exec.LookPath("ffmpeg")
+	if ffmpegErr != nil {
+		l.Warn().Msg("ffmpeg not found in PATH — decode validation will be skipped. Add ffmpeg to the container to enable full validation.")
+	}
+	_, ffprobeErr := exec.LookPath("ffprobe")
+	if ffprobeErr != nil {
+		l.Warn().Msg("ffprobe not found in PATH — metadata validation will be skipped.")
+	}
+
 	return &FileValidator{
-		logger:          logger.New("validator"),
-		ProbeTimeout:    30 * time.Second,
-		DecodeTimeout:   decodeTimeout,
-		DecodeWindowSec: decodeWindowSec,
-		DeepScan:        deep,
+		logger:           l,
+		ProbeTimeout:     30 * time.Second,
+		DecodeTimeout:    decodeTimeout,
+		DecodeWindowSec:  decodeWindowSec,
+		DeepScan:         deep,
+		ffmpegAvailable:  ffmpegErr == nil,
+		ffprobeAvailable: ffprobeErr == nil,
 	}
 }
 
@@ -55,9 +69,16 @@ func (v *FileValidator) ValidateFile(ctx context.Context, filepath string) (brok
 	}
 	v.logger.Debug().Str("file", filepath).Int64("size_bytes", fi.Size()).Msg("ValidateFile: starting ffprobe stage")
 	// Stage 1: FFprobe with metadata check
-	if err := v.runFFprobe(ctx, filepath); err != nil {
+	if !v.ffprobeAvailable {
+		v.logger.Debug().Str("file", filepath).Msg("ValidateFile: skipping ffprobe (not available)")
+	} else if err := v.runFFprobe(ctx, filepath); err != nil {
 		v.logger.Info().Err(err).Str("file", filepath).Msg("ValidateFile: ffprobe failed")
 		return true, fmt.Sprintf("ffprobe failed: %v", err)
+	}
+
+	if !v.ffmpegAvailable {
+		v.logger.Debug().Str("file", filepath).Msg("ValidateFile: skipping ffmpeg decode (not available)")
+		return false, ""
 	}
 
 	v.logger.Debug().
