@@ -151,23 +151,37 @@ func (v *FileValidator) runFFmpegDecode(ctx context.Context, filepath string) er
 	if len(snippet) > 500 {
 		snippet = snippet[:500] + "..."
 	}
+	exitCode := -1
+	if cmd.ProcessState != nil {
+		exitCode = cmd.ProcessState.ExitCode()
+	}
+	errStr := ""
+	if err != nil {
+		errStr = err.Error()
+	}
 	v.logger.Debug().
 		Str("file", filepath).
 		Dur("elapsed", elapsed).
-		Int("exit_code", cmd.ProcessState.ExitCode()).
+		Int("exit_code", exitCode).
+		Str("err", errStr).
 		Int("output_bytes", len(out)).
 		Str("ffmpeg_output", snippet).
 		Msg("ValidateFile: raw ffmpeg output")
 
 	if err != nil {
 		if ctx.Err() != nil {
-			return fmt.Errorf("decode timeout after %s", elapsed)
+			return fmt.Errorf("decode context cancelled/timeout after %s: %w", elapsed, ctx.Err())
 		}
-		// Non-zero exit: if there is any output, treat it as a decode error.
-		// Empty output with non-zero exit (e.g. stream-map mismatch) is not corruption.
+		// Signal-killed (exit_code=-1) or any non-zero exit with no output still
+		// means ffmpeg did not complete a clean decode — treat it as broken.
+		if exitCode == -1 {
+			return fmt.Errorf("decode process killed by signal after %s (err: %s)", elapsed, errStr)
+		}
 		if len(strings.TrimSpace(string(out))) > 0 {
 			return fmt.Errorf("decode error: %s", strings.TrimSpace(string(out)))
 		}
+		// Non-zero exit with no output typically means a stream-map mismatch
+		// (e.g. no audio stream). Don't fail on that.
 		return nil
 	}
 
