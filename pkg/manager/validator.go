@@ -2,9 +2,11 @@ package manager
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
@@ -24,6 +26,26 @@ type FileValidator struct {
 
 	ffmpegAvailable  bool
 	ffprobeAvailable bool
+	ffmpegSlots      chan struct{}
+
+	SmokeOnAudioStreamsMin int
+	SmokeOnTotalStreamsMin int
+}
+
+type probeReport struct {
+	TotalStreams int
+	AudioStreams int
+	Suspicious   bool
+	Reason       string
+}
+
+type ffprobeJSON struct {
+	Streams []struct {
+		CodecType   string `json:"codec_type"`
+		Disposition struct {
+			AttachedPic int `json:"attached_pic"`
+		} `json:"disposition"`
+	} `json:"streams"`
 }
 
 // NewFileValidator creates a validator with hardcoded settings
@@ -33,9 +55,28 @@ func NewFileValidator() *FileValidator {
 	deep := strings.EqualFold(strings.TrimSpace(os.Getenv("DECYPHARR_VALIDATOR_DEEP_SCAN")), "true") || strings.TrimSpace(os.Getenv("DECYPHARR_VALIDATOR_DEEP_SCAN")) == "1"
 	decodeTimeout := 60 * time.Second
 	decodeWindowSec := 60
+	maxFFmpegConcurrent := 1
+	smokeOnAudioStreamsMin := 4
+	smokeOnTotalStreamsMin := 12
 	if deep {
 		decodeTimeout = 30 * time.Minute
 		decodeWindowSec = 0
+		maxFFmpegConcurrent = 1
+	}
+	if raw := strings.TrimSpace(os.Getenv("DECYPHARR_VALIDATOR_MAX_FFMPEG_CONCURRENCY")); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			maxFFmpegConcurrent = n
+		}
+	}
+	if raw := strings.TrimSpace(os.Getenv("DECYPHARR_VALIDATOR_SMOKE_ON_AUDIO_STREAMS_MIN")); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n >= 0 {
+			smokeOnAudioStreamsMin = n
+		}
+	}
+	if raw := strings.TrimSpace(os.Getenv("DECYPHARR_VALIDATOR_SMOKE_ON_TOTAL_STREAMS_MIN")); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n >= 0 {
+			smokeOnTotalStreamsMin = n
+		}
 	}
 
 	_, ffmpegErr := exec.LookPath("ffmpeg")
@@ -48,13 +89,16 @@ func NewFileValidator() *FileValidator {
 	}
 
 	return &FileValidator{
-		logger:           l,
-		ProbeTimeout:     30 * time.Second,
-		DecodeTimeout:    decodeTimeout,
-		DecodeWindowSec:  decodeWindowSec,
-		DeepScan:         deep,
-		ffmpegAvailable:  ffmpegErr == nil,
-		ffprobeAvailable: ffprobeErr == nil,
+		logger:                 l,
+		ProbeTimeout:           30 * time.Second,
+		DecodeTimeout:          decodeTimeout,
+		DecodeWindowSec:        decodeWindowSec,
+		DeepScan:               deep,
+		ffmpegAvailable:        ffmpegErr == nil,
+		ffprobeAvailable:       ffprobeErr == nil,
+		ffmpegSlots:            make(chan struct{}, maxFFmpegConcurrent),
+		SmokeOnAudioStreamsMin: smokeOnAudioStreamsMin,
+		SmokeOnTotalStreamsMin: smokeOnTotalStreamsMin,
 	}
 }
 
@@ -68,12 +112,15 @@ func (v *FileValidator) ValidateFile(ctx context.Context, filepath string) (brok
 		return false, ""
 	}
 	v.logger.Debug().Str("file", filepath).Int64("size_bytes", fi.Size()).Msg("ValidateFile: starting ffprobe stage")
+	report := probeReport{}
 	// Stage 1: FFprobe with metadata check
 	if !v.ffprobeAvailable {
 		v.logger.Debug().Str("file", filepath).Msg("ValidateFile: skipping ffprobe (not available)")
-	} else if err := v.runFFprobe(ctx, filepath); err != nil {
+	} else if r, err := v.runFFprobe(ctx, filepath); err != nil {
 		v.logger.Info().Err(err).Str("file", filepath).Msg("ValidateFile: ffprobe failed")
 		return true, fmt.Sprintf("ffprobe failed: %v", err)
+	} else {
+		report = r
 	}
 
 	if !v.ffmpegAvailable {
@@ -81,10 +128,28 @@ func (v *FileValidator) ValidateFile(ctx context.Context, filepath string) (brok
 		return false, ""
 	}
 
+	shouldSmoke := v.DeepScan || !v.ffprobeAvailable || report.Suspicious
+	if !shouldSmoke {
+		v.logger.Debug().
+			Str("file", filepath).
+			Int("total_streams", report.TotalStreams).
+			Int("audio_streams", report.AudioStreams).
+			Msg("ValidateFile: skipping ffmpeg smoke test (metadata not suspicious)")
+		return false, ""
+	}
+
+	// Bound ffmpeg decode concurrency globally so repair runs don't peg CPU.
+	v.ffmpegSlots <- struct{}{}
+	defer func() { <-v.ffmpegSlots }()
+
 	v.logger.Debug().
 		Str("file", filepath).
 		Bool("deep_scan", v.DeepScan).
 		Int("decode_window_sec", v.DecodeWindowSec).
+		Str("smoke_reason", report.Reason).
+		Int("total_streams", report.TotalStreams).
+		Int("audio_streams", report.AudioStreams).
+		Int("ffmpeg_max_concurrency", cap(v.ffmpegSlots)).
 		Msg("ValidateFile: ffprobe passed, starting ffmpeg decode stage")
 	// Stage 2: FFmpeg decode validation
 	if err := v.runFFmpegDecode(ctx, filepath); err != nil {
@@ -97,7 +162,8 @@ func (v *FileValidator) ValidateFile(ctx context.Context, filepath string) (brok
 }
 
 // runFFprobe executes ffprobe to validate metadata
-func (v *FileValidator) runFFprobe(ctx context.Context, filepath string) error {
+func (v *FileValidator) runFFprobe(ctx context.Context, filepath string) (probeReport, error) {
+	report := probeReport{}
 	ctx, cancel := context.WithTimeout(ctx, v.ProbeTimeout)
 	defer cancel()
 
@@ -114,12 +180,12 @@ func (v *FileValidator) runFFprobe(ctx context.Context, filepath string) error {
 	v.logger.Trace().Str("file", filepath).Str("ffprobe_output", snippet).Err(err).Msg("ValidateFile: raw ffprobe output")
 
 	if hasDecoderErrors(out) {
-		return fmt.Errorf("probe reported decoder errors: %s", strings.TrimSpace(string(out)))
+		return report, fmt.Errorf("probe reported decoder errors: %s", strings.TrimSpace(string(out)))
 	}
 
 	if err != nil {
 		if ctx.Err() != nil {
-			return fmt.Errorf("probe timeout")
+			return report, fmt.Errorf("probe timeout")
 		}
 		// Very little output usually means the demuxer couldn't open the file at all;
 		// try again with higher buffer settings.
@@ -130,17 +196,62 @@ func (v *FileValidator) runFFprobe(ctx context.Context, filepath string) error {
 				"-print_format", "json", "-show_format", "-show_streams", filepath)
 			out2, err2 := cmd2.CombinedOutput()
 			if err2 != nil {
-				return fmt.Errorf("fallback probe also failed: %w", err2)
+				return report, fmt.Errorf("fallback probe also failed: %w", err2)
 			}
 			if hasDecoderErrors(out2) {
-				return fmt.Errorf("fallback probe reported decoder errors")
+				return report, fmt.Errorf("fallback probe reported decoder errors")
 			}
+			out = out2
 		} else {
-			return fmt.Errorf("probe failed: %w", err)
+			return report, fmt.Errorf("probe failed: %w", err)
 		}
 	}
 
-	return nil
+	report = v.buildProbeReport(out)
+	return report, nil
+}
+
+func (v *FileValidator) buildProbeReport(out []byte) probeReport {
+	report := probeReport{}
+	payload := extractJSONPayload(out)
+	if len(payload) == 0 {
+		return report
+	}
+
+	var meta ffprobeJSON
+	if err := json.Unmarshal(payload, &meta); err != nil {
+		return report
+	}
+
+	report.TotalStreams = len(meta.Streams)
+	for _, s := range meta.Streams {
+		if s.CodecType == "audio" {
+			report.AudioStreams++
+		}
+	}
+
+	if report.AudioStreams >= v.SmokeOnAudioStreamsMin {
+		report.Suspicious = true
+		report.Reason = fmt.Sprintf("audio_streams>=%d", v.SmokeOnAudioStreamsMin)
+		return report
+	}
+	if report.TotalStreams >= v.SmokeOnTotalStreamsMin {
+		report.Suspicious = true
+		report.Reason = fmt.Sprintf("total_streams>=%d", v.SmokeOnTotalStreamsMin)
+		return report
+	}
+
+	report.Reason = "metadata_not_suspicious"
+	return report
+}
+
+func extractJSONPayload(out []byte) []byte {
+	text := strings.TrimSpace(string(out))
+	start := strings.Index(text, "{")
+	if start < 0 {
+		return nil
+	}
+	return []byte(text[start:])
 }
 
 // runFFmpegDecode runs either a fast 60s smoke test (default) or full-file
