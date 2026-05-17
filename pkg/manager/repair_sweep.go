@@ -285,7 +285,10 @@ func (r *Repair) probeNZBFile(ctx context.Context, entry *storage.Entry, name st
 		return res
 	}
 	r.logger.Debug().Str("file", name).Str("infohash", entry.InfoHash).Msg("probeNZBFile: running usenet CheckFile")
+	checkStart := time.Now()
 	err := r.manager.usenet.CheckFile(ctx, entry.InfoHash, name)
+	checkDur := time.Since(checkStart)
+	r.logger.Debug().Str("file", name).Dur("checkfile_dur", checkDur).Err(err).Msg("probeNZBFile: usenet CheckFile finished")
 	if err == nil {
 		res.healthy = true
 	} else if errors.Is(err, customerror.UsenetSegmentMissingError) {
@@ -307,8 +310,10 @@ func (r *Repair) probeNZBFile(ctx context.Context, entry *storage.Entry, name st
 			// Don't fail the check if we can't get path; let usenet CheckFile result stand
 		} else {
 			r.logger.Debug().Str("file", name).Str("path", filePath).Msg("probeNZBFile: running file validator")
+			validateStart := time.Now()
 			broken, reason := r.validator.ValidateFile(ctx, filePath)
-			r.logger.Debug().Str("file", name).Bool("broken", broken).Str("reason", reason).Msg("probeNZBFile: validator result")
+			validateDur := time.Since(validateStart)
+			r.logger.Debug().Str("file", name).Dur("validator_dur", validateDur).Bool("broken", broken).Str("reason", reason).Msg("probeNZBFile: validator result")
 			if broken {
 				res.healthy = false
 				res.broken = true
