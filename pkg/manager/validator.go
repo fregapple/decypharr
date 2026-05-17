@@ -47,7 +47,13 @@ func NewFileValidator() *FileValidator {
 // ValidateFile runs ffprobe and ffmpeg checks on a file.
 // Returns broken=true if validation fails, along with a reason string.
 func (v *FileValidator) ValidateFile(ctx context.Context, filepath string) (broken bool, reason string) {
-	v.logger.Debug().Str("file", filepath).Msg("ValidateFile: starting ffprobe stage")
+	// Quick existence/size check before shelling out to ffprobe.
+	fi, statErr := os.Stat(filepath)
+	if statErr != nil {
+		v.logger.Warn().Err(statErr).Str("file", filepath).Msg("ValidateFile: file not accessible, skipping")
+		return false, ""
+	}
+	v.logger.Debug().Str("file", filepath).Int64("size_bytes", fi.Size()).Msg("ValidateFile: starting ffprobe stage")
 	// Stage 1: FFprobe with metadata check
 	if err := v.runFFprobe(ctx, filepath); err != nil {
 		v.logger.Info().Err(err).Str("file", filepath).Msg("ValidateFile: ffprobe failed")
@@ -74,29 +80,43 @@ func (v *FileValidator) runFFprobe(ctx context.Context, filepath string) error {
 	ctx, cancel := context.WithTimeout(ctx, v.ProbeTimeout)
 	defer cancel()
 
-	// Primary probe with JSON output, matching the manual repro more closely.
+	// Primary probe — collect combined output regardless of exit code so we
+	// can inspect stderr decoder warnings on files that exit 0.
 	cmd := exec.CommandContext(ctx, "ffprobe", "-v", "error", "-print_format", "json", "-show_format", "-show_streams", "-probesize", "50000000", filepath)
+	out, err := cmd.CombinedOutput()
 
-	if out, err := cmd.CombinedOutput(); err != nil {
+	// Always log a truncated snippet at Trace so we can see what ffprobe produced.
+	snippet := strings.TrimSpace(string(out))
+	if len(snippet) > 500 {
+		snippet = snippet[:500] + "..."
+	}
+	v.logger.Trace().Str("file", filepath).Str("ffprobe_output", snippet).Err(err).Msg("ValidateFile: raw ffprobe output")
+
+	if hasDecoderErrors(out) {
+		return fmt.Errorf("probe reported decoder errors: %s", strings.TrimSpace(string(out)))
+	}
+
+	if err != nil {
 		if ctx.Err() != nil {
 			return fmt.Errorf("probe timeout")
 		}
-		// If output is empty or minimal, try fallback probe with higher analyzeduration
+		// Very little output usually means the demuxer couldn't open the file at all;
+		// try again with higher buffer settings.
 		if len(out) < 10 {
 			v.logger.Debug().Str("file", filepath).Msg("Fallback ffprobe with higher analyzeduration")
-			cmd = exec.CommandContext(ctx, "ffprobe", "-v", "error",
+			cmd2 := exec.CommandContext(ctx, "ffprobe", "-v", "error",
 				"-analyzeduration", "100M", "-probesize", "100M",
 				"-print_format", "json", "-show_format", "-show_streams", filepath)
-			if out, err := cmd.CombinedOutput(); err != nil {
-				return fmt.Errorf("fallback probe also failed: %w", err)
-			} else if hasDecoderErrors(out) {
+			out2, err2 := cmd2.CombinedOutput()
+			if err2 != nil {
+				return fmt.Errorf("fallback probe also failed: %w", err2)
+			}
+			if hasDecoderErrors(out2) {
 				return fmt.Errorf("fallback probe reported decoder errors")
 			}
-		} else if hasDecoderErrors(out) {
-			return fmt.Errorf("probe reported decoder errors: %s", strings.TrimSpace(string(out)))
+		} else {
+			return fmt.Errorf("probe failed: %w", err)
 		}
-	} else if hasDecoderErrors(out) {
-		return fmt.Errorf("probe reported decoder errors: %s", strings.TrimSpace(string(out)))
 	}
 
 	return nil
@@ -110,34 +130,51 @@ func (v *FileValidator) runFFmpegDecode(ctx context.Context, filepath string) er
 
 	args := []string{"-v", "error", "-xerror"}
 	if !v.DeepScan && v.DecodeWindowSec > 0 {
-		// Fast mode: keep this cheap for large libraries.
 		args = append(args, "-t", fmt.Sprintf("%d", v.DecodeWindowSec))
 	}
 	args = append(args, "-i", filepath)
 	if v.DeepScan {
-		// Deep mode: validate every stream in the file.
 		args = append(args, "-map", "0")
 	} else {
-		// Fast mode: probe primary video/audio streams for quick detection.
 		args = append(args, "-map", "0:v:0", "-map", "0:a:0")
 	}
 	args = append(args, "-f", "null", "-")
 
-	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
+	v.logger.Debug().Str("file", filepath).Strs("args", args).Msg("ValidateFile: running ffmpeg")
 
-	if out, err := cmd.CombinedOutput(); err != nil {
+	start := time.Now()
+	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
+	out, err := cmd.CombinedOutput()
+	elapsed := time.Since(start)
+
+	snippet := strings.TrimSpace(string(out))
+	if len(snippet) > 500 {
+		snippet = snippet[:500] + "..."
+	}
+	v.logger.Debug().
+		Str("file", filepath).
+		Dur("elapsed", elapsed).
+		Int("exit_code", cmd.ProcessState.ExitCode()).
+		Int("output_bytes", len(out)).
+		Str("ffmpeg_output", snippet).
+		Msg("ValidateFile: raw ffmpeg output")
+
+	if err != nil {
 		if ctx.Err() != nil {
-			return fmt.Errorf("decode timeout")
+			return fmt.Errorf("decode timeout after %s", elapsed)
 		}
-		// Check if error is about missing streams (acceptable for audio-only, etc)
-		// Only fail on actual decode errors (NAL unit, frame errors, etc)
-		if len(out) > 0 {
-			return fmt.Errorf("decode error: %s", string(out))
+		// Non-zero exit: if there is any output, treat it as a decode error.
+		// Empty output with non-zero exit (e.g. stream-map mismatch) is not corruption.
+		if len(strings.TrimSpace(string(out))) > 0 {
+			return fmt.Errorf("decode error: %s", strings.TrimSpace(string(out)))
 		}
-		// -map errors are OK if streams don't exist; actual corruption shows explicit errors
 		return nil
-	} else if hasDecoderErrors(out) {
-		return fmt.Errorf("decode reported decoder errors: %s", strings.TrimSpace(string(out)))
+	}
+
+	// Exit 0 but stderr had decoder warnings (e.g. EAC3 bitstream errors that
+	// ffmpeg recovers from but still indicate a broken file).
+	if hasDecoderErrors(out) {
+		return fmt.Errorf("decode reported decoder errors: %s", snippet)
 	}
 
 	return nil
