@@ -287,13 +287,35 @@ func (r *Repair) probeNZBFile(ctx context.Context, entry *storage.Entry, name st
 	err := r.manager.usenet.CheckFile(ctx, entry.InfoHash, name)
 	if err == nil {
 		res.healthy = true
-		return res
-	}
-	if errors.Is(err, customerror.UsenetSegmentMissingError) {
+	} else if errors.Is(err, customerror.UsenetSegmentMissingError) {
 		res.broken = true
 		res.reason = "usenet_segment_missing"
+		return res
 	} else {
 		res.reason = "usenet_probe_error"
+	}
+
+	// Additional file integrity validation for Usenet files
+	// Run ffprobe/ffmpeg checks if file passed usenet CheckFile
+	if res.healthy && r.validator != nil {
+		// Get full file path from entry
+		filePath, err := r.getFilePathForValidation(entry, name)
+		if err != nil {
+			r.logger.Trace().Err(err).Str("file", name).Msg("Could not determine file path for validation")
+			// Don't fail the check if we can't get path; let usenet CheckFile result stand
+		} else {
+			broken, reason := r.validator.ValidateFile(ctx, filePath)
+			if broken {
+				res.healthy = false
+				res.broken = true
+				res.reason = reason
+				r.logger.Info().Str("file", name).Str("reason", reason).Msg("File validation failed")
+			}
+		}
+	}
+
+	if res.healthy {
+		res.reason = ""
 	}
 	return res
 }
@@ -1356,4 +1378,31 @@ func arrKindFromType(t arr.Type) storage.ArrKind {
 	default:
 		return storage.ArrKindOther
 	}
+}
+
+// getFilePathForValidation attempts to resolve the actual file path from an entry
+func (r *Repair) getFilePathForValidation(entry *storage.Entry, fileName string) (string, error) {
+	if entry == nil || entry.GetActiveProvider() == nil || entry.GetActiveProvider().Files == nil {
+		return "", fmt.Errorf("entry or files not found")
+	}
+
+	file, ok := entry.GetActiveProvider().Files[fileName]
+	if !ok || file == nil {
+		return "", fmt.Errorf("file metadata not found: %s", fileName)
+	}
+
+	// Try to use link or ID to locate file
+	// The actual path resolution depends on how files are stored in the mount
+	// For now, we construct a reasonable path from available metadata
+	if file.Link != "" {
+		// Link might be a full path or relative path depending on provider
+		return file.Link, nil
+	}
+	if file.Id != "" {
+		// Try to build a path from the entry name and file ID
+		// This is a fallback and may not always work
+		return filepath.Join(config.Get().DownloadFolder, entry.InfoHash, fileName), nil
+	}
+
+	return "", fmt.Errorf("no resolvable path for file: %s", fileName)
 }

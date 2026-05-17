@@ -1,0 +1,22 @@
+{
+  "base_url": "http://localhost:8282",
+  "api_token": "YOUR_API_TOKEN",
+  "provider": "realdebrid",
+  "apply": false,
+  "remove_from_debrid": true,
+  "verbose": true,
+  "allow_zero_symlink_targets": false,
+  "max_delete": 200,
+  "delete_attempts": 3,
+  "full_regex": true,
+  "failed_regex": false,
+  "arr_host_map": {
+    "sonarr_client": "http://localhost:8989",
+    "radarr_client": "http://localhost:7878",
+    "sonarr4k_client": "http://localhost:8988",
+    "radarr4k_client": "http://localhost:7879"
+  },
+  "path_map": {
+    "/data": "/mnt/storage"
+  }
+}
