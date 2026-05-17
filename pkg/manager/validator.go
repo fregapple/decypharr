@@ -32,16 +32,21 @@ func NewFileValidator() *FileValidator {
 // ValidateFile runs ffprobe and ffmpeg checks on a file.
 // Returns broken=true if validation fails, along with a reason string.
 func (v *FileValidator) ValidateFile(ctx context.Context, filepath string) (broken bool, reason string) {
+	v.logger.Debug().Str("file", filepath).Msg("ValidateFile: starting ffprobe stage")
 	// Stage 1: FFprobe with metadata check
 	if err := v.runFFprobe(ctx, filepath); err != nil {
+		v.logger.Info().Err(err).Str("file", filepath).Msg("ValidateFile: ffprobe failed")
 		return true, fmt.Sprintf("ffprobe failed: %v", err)
 	}
 
+	v.logger.Debug().Str("file", filepath).Msg("ValidateFile: ffprobe passed, starting ffmpeg decode stage")
 	// Stage 2: FFmpeg decode smoke test (first 60 seconds)
 	if err := v.runFFmpegDecode(ctx, filepath); err != nil {
+		v.logger.Info().Err(err).Str("file", filepath).Msg("ValidateFile: ffmpeg decode failed")
 		return true, fmt.Sprintf("ffmpeg decode failed: %v", err)
 	}
 
+	v.logger.Debug().Str("file", filepath).Msg("ValidateFile: passed all checks")
 	return false, ""
 }
 

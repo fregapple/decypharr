@@ -284,6 +284,7 @@ func (r *Repair) probeNZBFile(ctx context.Context, entry *storage.Entry, name st
 		res.reason = "usenet_client_not_configured"
 		return res
 	}
+	r.logger.Debug().Str("file", name).Str("infohash", entry.InfoHash).Msg("probeNZBFile: running usenet CheckFile")
 	err := r.manager.usenet.CheckFile(ctx, entry.InfoHash, name)
 	if err == nil {
 		res.healthy = true
@@ -297,19 +298,22 @@ func (r *Repair) probeNZBFile(ctx context.Context, entry *storage.Entry, name st
 
 	// Additional file integrity validation for Usenet files
 	// Run ffprobe/ffmpeg checks if file passed usenet CheckFile
+	r.logger.Debug().Str("file", name).Bool("healthy", res.healthy).Bool("validator_nil", r.validator == nil).Msg("probeNZBFile: post-CheckFile state")
 	if res.healthy && r.validator != nil {
 		// Get full file path from entry
 		filePath, err := r.getFilePathForValidation(entry, name)
 		if err != nil {
-			r.logger.Trace().Err(err).Str("file", name).Msg("Could not determine file path for validation")
+			r.logger.Warn().Err(err).Str("file", name).Msg("probeNZBFile: could not resolve file path for validation")
 			// Don't fail the check if we can't get path; let usenet CheckFile result stand
 		} else {
+			r.logger.Debug().Str("file", name).Str("path", filePath).Msg("probeNZBFile: running file validator")
 			broken, reason := r.validator.ValidateFile(ctx, filePath)
+			r.logger.Debug().Str("file", name).Bool("broken", broken).Str("reason", reason).Msg("probeNZBFile: validator result")
 			if broken {
 				res.healthy = false
 				res.broken = true
 				res.reason = reason
-				r.logger.Info().Str("file", name).Str("reason", reason).Msg("File validation failed")
+				r.logger.Info().Str("file", name).Str("reason", reason).Msg("probeNZBFile: file validation failed")
 			}
 		}
 	}
