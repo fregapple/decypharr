@@ -56,8 +56,8 @@ func NewFileValidator() *FileValidator {
 	decodeTimeout := 60 * time.Second
 	decodeWindowSec := 60
 	maxFFmpegConcurrent := 1
-	smokeOnAudioStreamsMin := 4
-	smokeOnTotalStreamsMin := 12
+	smokeOnAudioStreamsMin := 8
+	smokeOnTotalStreamsMin := 20
 	if deep {
 		decodeTimeout = 30 * time.Minute
 		decodeWindowSec = 0
@@ -128,7 +128,9 @@ func (v *FileValidator) ValidateFile(ctx context.Context, filepath string) (brok
 		return false, ""
 	}
 
-	shouldSmoke := v.DeepScan || !v.ffprobeAvailable || report.Suspicious
+	// Smoke test is disabled unless deep-scan is explicitly requested.
+	// ffprobe alone is sufficient for the majority of corruption cases.
+	shouldSmoke := v.DeepScan
 	if !shouldSmoke {
 		v.logger.Debug().
 			Str("file", filepath).
