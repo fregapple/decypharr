@@ -1380,29 +1380,15 @@ func arrKindFromType(t arr.Type) storage.ArrKind {
 	}
 }
 
-// getFilePathForValidation attempts to resolve the actual file path from an entry
+// getFilePathForValidation returns the FUSE mount path for a Usenet file so that
+// ffprobe/ffmpeg can stream it directly from the decypharr filesystem.
 func (r *Repair) getFilePathForValidation(entry *storage.Entry, fileName string) (string, error) {
-	if entry == nil || entry.GetActiveProvider() == nil || entry.GetActiveProvider().Files == nil {
-		return "", fmt.Errorf("entry or files not found")
+	if entry == nil {
+		return "", fmt.Errorf("entry is nil")
 	}
-
-	file, ok := entry.GetActiveProvider().Files[fileName]
-	if !ok || file == nil {
-		return "", fmt.Errorf("file metadata not found: %s", fileName)
+	mountBase := r.manager.GetTorrentMountPath(entry)
+	if mountBase == "" {
+		return "", fmt.Errorf("mount path not configured")
 	}
-
-	// Try to use link or ID to locate file
-	// The actual path resolution depends on how files are stored in the mount
-	// For now, we construct a reasonable path from available metadata
-	if file.Link != "" {
-		// Link might be a full path or relative path depending on provider
-		return file.Link, nil
-	}
-	if file.Id != "" {
-		// Try to build a path from the entry name and file ID
-		// This is a fallback and may not always work
-		return filepath.Join(config.Get().DownloadFolder, entry.InfoHash, fileName), nil
-	}
-
-	return "", fmt.Errorf("no resolvable path for file: %s", fileName)
+	return filepath.Join(mountBase, fileName), nil
 }
