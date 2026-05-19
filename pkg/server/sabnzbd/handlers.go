@@ -288,11 +288,7 @@ func (s *SABnzbd) handleAddURL(w http.ResponseWriter, r *http.Request) {
 
 	urls := r.URL.Query().Get("name")
 
-	cfg := config.Get()
-	action := cfg.DefaultDownloadAction
-	if r.URL.Query().Get("action") != "" {
-		action = config.DownloadAction(r.URL.Query().Get("action"))
-	}
+	action := resolveRequestedAction(r)
 
 	if urls == "" {
 		s.writeError(w, "URL is required", http.StatusBadRequest)
@@ -366,11 +362,7 @@ func (s *SABnzbd) handleAddFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cfg := config.Get()
-	action := cfg.DefaultDownloadAction
-	if r.URL.Query().Get("action") != "" {
-		action = config.DownloadAction(r.URL.Query().Get("action"))
-	}
+	action := resolveRequestedAction(r)
 
 	var nzoIDs []string
 	var errors []string
@@ -457,6 +449,24 @@ func (s *SABnzbd) handleAddFile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	utils.JSONResponse(w, response, http.StatusOK)
+}
+
+// resolveRequestedAction determines the post-download action for SAB add requests.
+// Priority "forced" (2) is treated as an explicit request to download files, which
+// enables separate SAB clients (tag-routed in Arr) to toggle download vs symlink.
+func resolveRequestedAction(r *http.Request) config.DownloadAction {
+	cfg := config.Get()
+	action := cfg.DefaultDownloadAction
+
+	if raw := strings.TrimSpace(r.URL.Query().Get("action")); raw != "" {
+		return config.DownloadAction(raw)
+	}
+
+	if strings.TrimSpace(r.URL.Query().Get("priority")) == PriorityForced {
+		return config.DownloadActionDownload
+	}
+
+	return action
 }
 
 // handleVersion returns version information
