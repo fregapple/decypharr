@@ -118,7 +118,7 @@ func (v *FileValidator) ValidateFile(ctx context.Context, filepath string) (brok
 		v.logger.Debug().Str("file", filepath).Msg("ValidateFile: skipping ffprobe (not available)")
 	} else if r, err := v.runFFprobe(ctx, filepath); err != nil {
 		v.logger.Info().Err(err).Str("file", filepath).Msg("ValidateFile: ffprobe failed")
-		return true, fmt.Sprintf("ffprobe failed: %v", err)
+		return true, "ffprobe failed"
 	} else {
 		report = r
 	}
