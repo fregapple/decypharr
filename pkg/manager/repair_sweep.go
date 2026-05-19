@@ -284,16 +284,47 @@ func (r *Repair) probeNZBFile(ctx context.Context, entry *storage.Entry, name st
 		res.reason = "usenet_client_not_configured"
 		return res
 	}
+	r.logger.Debug().Str("file", name).Str("infohash", entry.InfoHash).Msg("probeNZBFile: running usenet CheckFile")
+	checkStart := time.Now()
 	err := r.manager.usenet.CheckFile(ctx, entry.InfoHash, name)
+	checkDur := time.Since(checkStart)
+	r.logger.Debug().Str("file", name).Dur("checkfile_dur", checkDur).Err(err).Msg("probeNZBFile: usenet CheckFile finished")
 	if err == nil {
 		res.healthy = true
-		return res
-	}
-	if errors.Is(err, customerror.UsenetSegmentMissingError) {
+	} else if errors.Is(err, customerror.UsenetSegmentMissingError) {
 		res.broken = true
 		res.reason = "usenet_segment_missing"
+		return res
 	} else {
 		res.reason = "usenet_probe_error"
+	}
+
+	// Additional file integrity validation for Usenet files
+	// Run ffprobe/ffmpeg checks if file passed usenet CheckFile
+	r.logger.Debug().Str("file", name).Bool("healthy", res.healthy).Bool("validator_nil", r.validator == nil).Msg("probeNZBFile: post-CheckFile state")
+	if res.healthy && r.validator != nil {
+		// Get full file path from entry
+		filePath, err := r.getFilePathForValidation(entry, name)
+		if err != nil {
+			r.logger.Warn().Err(err).Str("file", name).Msg("probeNZBFile: could not resolve file path for validation")
+			// Don't fail the check if we can't get path; let usenet CheckFile result stand
+		} else {
+			r.logger.Debug().Str("file", name).Str("path", filePath).Msg("probeNZBFile: running file validator")
+			validateStart := time.Now()
+			broken, reason := r.validator.ValidateFile(ctx, filePath)
+			validateDur := time.Since(validateStart)
+			r.logger.Debug().Str("file", name).Dur("validator_dur", validateDur).Bool("broken", broken).Str("reason", reason).Msg("probeNZBFile: validator result")
+			if broken {
+				res.healthy = false
+				res.broken = true
+				res.reason = reason
+				r.logger.Info().Str("file", name).Str("reason", reason).Msg("probeNZBFile: file validation failed")
+			}
+		}
+	}
+
+	if res.healthy {
+		res.reason = ""
 	}
 	return res
 }
@@ -1356,4 +1387,17 @@ func arrKindFromType(t arr.Type) storage.ArrKind {
 	default:
 		return storage.ArrKindOther
 	}
+}
+
+// getFilePathForValidation returns the FUSE mount path for a Usenet file so that
+// ffprobe/ffmpeg can stream it directly from the decypharr filesystem.
+func (r *Repair) getFilePathForValidation(entry *storage.Entry, fileName string) (string, error) {
+	if entry == nil {
+		return "", fmt.Errorf("entry is nil")
+	}
+	mountBase := r.manager.GetTorrentMountPath(entry)
+	if mountBase == "" {
+		return "", fmt.Errorf("mount path not configured")
+	}
+	return filepath.Join(mountBase, fileName), nil
 }

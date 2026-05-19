@@ -41,7 +41,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     go build -trimpath -ldflags="-w -s" \
     -o /healthcheck cmd/healthcheck/main.go
 
-# Stage 1.5: Download static ffprobe binary
+# Stage 1.5: Download static ffprobe and ffmpeg binaries
 FROM alpine:latest AS ffprobe-extractor
 ARG TARGETARCH
 WORKDIR /tmp
@@ -54,7 +54,11 @@ RUN apk add --no-cache curl unzip && \
     curl -L "https://github.com/ffbinaries/ffbinaries-prebuilt/releases/download/v6.1/ffprobe-6.1-${PLATFORM}.zip" -o ffprobe.zip && \
     unzip ffprobe.zip && \
     chmod +x ffprobe && \
-    mv ffprobe /ffprobe
+    mv ffprobe /ffprobe && \
+    curl -L "https://github.com/ffbinaries/ffbinaries-prebuilt/releases/download/v6.1/ffmpeg-6.1-${PLATFORM}.zip" -o ffmpeg.zip && \
+    unzip ffmpeg.zip && \
+    chmod +x ffmpeg && \
+    mv ffmpeg /ffmpeg
 
 # Stage 2: Final image
 FROM alpine:latest
@@ -88,6 +92,7 @@ RUN apk add --no-cache fuse3 ca-certificates su-exec shadow curl unzip tzdata &&
 COPY --from=builder /decypharr /usr/bin/decypharr
 COPY --from=builder /healthcheck /usr/bin/healthcheck
 COPY --from=ffprobe-extractor /ffprobe /usr/bin/ffprobe
+COPY --from=ffprobe-extractor /ffmpeg /usr/bin/ffmpeg
 COPY scripts/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 

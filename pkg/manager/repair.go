@@ -62,6 +62,7 @@ type Repair struct {
 	manager   *Manager
 	scheduler gocron.Scheduler
 	logger    zerolog.Logger
+	validator *FileValidator // Custom file integrity validator
 
 	mu          sync.Mutex
 	parentCtx   context.Context
@@ -78,6 +79,7 @@ func NewRepair(m *Manager) *Repair {
 		manager:   m,
 		scheduler: m.scheduler,
 		logger:    logger.New("repair"),
+		validator: NewFileValidator(),
 		parentCtx: context.Background(),
 	}
 }
